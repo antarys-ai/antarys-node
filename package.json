@@ -1,5 +1,5 @@
 {
-	"name": "antarys-node",
+	"name": "antarys",
 	"version": "0.1.0",
 	"description": "High-performance Node.js client for Antarys vector database with HTTP/2, connection pooling, and intelligent caching",
 	"main": "dist/index.js",
