@@ -733,7 +733,6 @@ class WorkerPool {
 
 		let workerPath: string | null = null;
 		for (const path of possiblePaths) {
-			console.log(path)
 			if (existsSync(path)) {
 				workerPath = path;
 				break;
