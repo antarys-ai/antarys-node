@@ -4,8 +4,8 @@
 		"module": "commonjs",
 		"moduleResolution": "node",
 		"outDir": "./dist",
-		"declaration": false,
-		"declarationMap": false,
+		"declaration": true,
+		"declarationMap": true,
 		"sourceMap": true,
 		"target": "ES2020"
 	}

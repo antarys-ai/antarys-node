@@ -3,10 +3,10 @@
 	"compilerOptions": {
 		"module": "esnext",
 		"moduleResolution": "node",
-		"outDir": "./dist-temp",
+		"outDir": "./dist",
 		"declaration": false,
 		"declarationMap": false,
-		"sourceMap": true,
+		"sourceMap": false,
 		"target": "ES2020"
 	}
 }

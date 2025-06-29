@@ -2,43 +2,28 @@
 	"name": "antarys",
 	"version": "0.1.2",
 	"description": "High-performance Node.js client for Antarys vector database with HTTP/2, connection pooling, and intelligent caching",
-	"main": "dist/index.js",
-	"module": "dist/index.mjs",
-	"types": "dist/index.d.ts",
+	"main": "dist/src/index.js",
+	"module": "dist/src/index.mjs",
+	"types": "dist/src/index.d.ts",
 	"exports": {
 		".": {
-			"import": "./dist/index.mjs",
-			"require": "./dist/index.js",
-			"types": "./dist/index.d.ts"
+			"import": "./dist/src/index.mjs",
+			"require": "./dist/src/index.js",
+			"types": "./dist/src/index.d.ts"
 		},
 		"./worker": {
-			"import": "./dist/worker.mjs",
-			"require": "./dist/worker.js"
+			"import": "./dist/src/worker.mjs",
+			"require": "./dist/src/worker.js"
 		}
 	},
-	"files": [
-		"dist/index.js",
-		"dist/index.mjs",
-		"dist/index.d.ts",
-		"dist/index.d.ts.map",
-		"dist/worker.js",
-		"dist/worker.mjs",
-		"dist/worker.d.ts",
-		"README.md",
-		"LICENSE",
-		"CHANGELOG.md"
-	],
 	"scripts": {
 		"dev": "tsx examples/basic.ts",
 		"dev:test": "tsx simple-test.ts",
-		"build": "npm run clean && npm run build:cjs && npm run build:esm && npm run build:bundle",
-		"build:cjs": "tsc -p tsconfig.json",
-		"build:esm": "tsc -p tsconfig.esm.json",
-		"build:bundle": "npm run copy:main && npm run copy:worker && npm run create:esm",
+		"build": "npm run clean && npm run build:cjs && npm run build:esm",
+		"build:cjs": "tsc -p tsconfig.cjs.json",
+		"build:esm": "tsc -p tsconfig.esm.json && npm run create:esm",
 		"clean": "rm -rf dist dist-esm dist-temp",
-		"copy:main": "cp dist-temp/src/index.js dist/index.js && cp dist/src/index.d.ts dist/index.d.ts && cp dist/src/index.d.ts.map dist/index.d.ts.map",
-		"copy:worker": "cp dist-temp/src/worker.js dist/worker.js && cp dist/src/worker.d.ts dist/worker.d.ts",
-		"create:esm": "cp dist/index.js dist/index.mjs && cp dist/worker.js dist/worker.mjs",
+		"create:esm": "find dist -name '*.js' -exec sh -c 'cp \"$1\" \"${1%.js}.mjs\"' _ {} \\;",
 		"format": "prettier --write \"src/**/*.ts\" \"shared/**/*.ts\"",
 		"typecheck": "tsc --noEmit",
 		"prepack": "npm run build",
@@ -49,6 +34,12 @@
 		"release": "npm run version:patch && npm publish",
 		"release:beta": "npm version prerelease --preid=beta && npm publish --tag beta"
 	},
+	"files": [
+		"dist/**/*",
+		"README.md",
+		"LICENSE",
+		"CHANGELOG.md"
+	],
 	"keywords": [
 		"vector-database",
 		"machine-learning",
