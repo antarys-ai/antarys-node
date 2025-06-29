@@ -1,0 +1,12 @@
+{
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"module": "esnext",
+		"moduleResolution": "node",
+		"outDir": "./dist",
+		"declaration": true,
+		"declarationMap": true,
+		"emitDeclarationOnly": true,
+		"sourceMap": false
+	}
+}

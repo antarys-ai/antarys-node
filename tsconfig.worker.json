@@ -1,0 +1,19 @@
+{
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"module": "commonjs",
+		"target": "ES2020",
+		"moduleResolution": "node",
+		"esModuleInterop": true,
+		"allowSyntheticDefaultImports": true,
+		"outDir": "./src",
+		"rootDir": "./src"
+	},
+	"include": [
+		"src/worker.ts"
+	],
+	"exclude": [
+		"node_modules",
+		"dist"
+	]
+}

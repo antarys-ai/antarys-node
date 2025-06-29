@@ -1,0 +1,12 @@
+{
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"module": "esnext",
+		"moduleResolution": "node",
+		"outDir": "./dist-temp",
+		"declaration": false,
+		"declarationMap": false,
+		"sourceMap": true,
+		"target": "ES2020"
+	}
+}
