@@ -2,12 +2,19 @@
 	"name": "antarys",
 	"version": "0.1.8",
 	"description": "High-performance Node.js client for Antarys vector database with HTTP/2, connection pooling, and intelligent caching",
-	"type": "module",
 	"main": "./dist/src/index.js",
 	"types": "./dist/src/index.d.ts",
-	"exports": "./dist/src/index.js",
+	"exports": {
+		".": {
+			"import": "./dist/src/index.js",
+			"require": "./dist/src/index.js",
+			"types": "./dist/src/index.d.ts"
+		}
+	},
 	"scripts": {
-		"build": "npm run clean && tsc",
+		"dev": "tsx examples/basic.ts",
+		"dev:test": "tsx simple-test.ts",
+		"build": "npm run clean && tsc && node -e \"const fs=require('fs');const path=require('path');function fix(d){fs.readdirSync(d).forEach(f=>{const p=path.join(d,f);if(fs.statSync(p).isDirectory())fix(p);else if(f.endsWith('.js')){let c=fs.readFileSync(p,'utf8');c=c.replace(/from\\s+['\\\"](\\\\.[\\/][^'\\\"]*)['\\\"];?/g,(m,i)=>m.replace(i,i+'.js'));fs.writeFileSync(p,c)}})}fix('dist')\"",
 		"clean": "rm -rf dist",
 		"format": "prettier --write \"src/**/*.ts\" \"shared/**/*.ts\"",
 		"typecheck": "tsc --noEmit",
