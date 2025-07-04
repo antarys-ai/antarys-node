@@ -1,4 +1,3 @@
-import * as http2 from 'http2';
 import * as https from 'https';
 import * as http from 'http';
 import { URL } from 'url';
@@ -17,7 +16,6 @@ import {
 	UpsertResponse,
 	HealthResponse,
 	InfoResponse,
-	PooledConnection,
 	RequestOptions,
 	Logger
 } from '../shared/types';
@@ -50,53 +48,54 @@ class ModuleLogger implements Logger {
 	}
 }
 
-function cleanJsonResponse(buffer: Buffer): Buffer {
-	let data = buffer.toString();
-	data = data.replace(/\x1b\[[0-9;]*m/g, '');
-	const jsonStart = data.indexOf('{');
-	const jsonEnd = data.lastIndexOf('}');
+const globalClients = new Set<Client>();
+let globalSigintHandlerInstalled = false;
 
-	if (jsonStart !== -1 && jsonEnd !== -1 && jsonEnd > jsonStart) {
-		data = data.substring(jsonStart, jsonEnd + 1);
-	}
+function installGlobalSigintHandler() {
+	if (globalSigintHandlerInstalled) return;
+	globalSigintHandlerInstalled = true;
 
-	data = data.replace(/[\x00-\x1f\x7f-\x9f]/g, '');
+	const cleanup = async () => {
+		const cleanupPromises = Array.from(globalClients).map(async (client) => {
+			try {
+				await client.close();
+			} catch (error) { }
+		});
 
-	return Buffer.from(data, 'utf8');
+		try {
+			await Promise.race([
+				Promise.all(cleanupPromises),
+				new Promise(resolve => setTimeout(resolve, 2000))
+			]);
+		} catch (error) { }
+
+		process.exit(0);
+	};
+
+	process.on('SIGINT', cleanup);
+	process.on('SIGTERM', cleanup);
 }
 
 export class Client extends EventEmitter {
 	private readonly host: string;
 	private readonly config: Required<ClientConfig>;
 	private readonly logger: Logger;
-
-	// Connection management
-	private connectionPool = new Map<string, PooledConnection>();
-	private readonly maxConnections: number;
-	private readonly maxStreamsPerConnection: number = 100;
-
-	// Performance optimizations
 	private readonly queryCache: QueryCache;
 	private readonly bufferPool: BufferPool;
 	private readonly collectionCache = new Map<string, CollectionInfo>();
-
-	// Metrics and monitoring
 	private requestCount = 0;
 	private requestTimes: number[] = [];
 	private readonly startTime = Date.now();
-
-	// Cleanup handling
 	private cleanupInterval?: NodeJS.Timeout;
 	private isDestroyed = false;
+	private pendingRequests = new Set<AbortController>();
 
 	constructor(host: string, config: ClientConfig = {}) {
 		super();
 
-		this.host = host.replace(/\/$/, ''); // Remove trailing slash
-
+		this.host = host.replace(/\/$/, '');
 		const cpuCount = cpus().length;
 
-		// Set intelligent defaults based on system capabilities
 		this.config = {
 			timeout: config.timeout ?? 120,
 			connectionPoolSize: config.connectionPoolSize ?? Math.max(cpuCount * 5, 20),
@@ -109,24 +108,18 @@ export class Client extends EventEmitter {
 		};
 
 		this.logger = new ModuleLogger(this.config.debug);
-		this.maxConnections = this.config.connectionPoolSize;
-
-		// Initialize performance components
 		this.queryCache = new QueryCache(this.config.cacheSize, this.config.cacheTtl * 1000);
 		this.bufferPool = new BufferPool(50);
+		this.cleanupInterval = setInterval(() => this.cleanup(), 30000);
 
-		// Setup periodic cleanup
-		this.cleanupInterval = setInterval(() => this.cleanup(), 30000); // Every 30 seconds
+		globalClients.add(this);
+		installGlobalSigintHandler();
 
-		// Handle process cleanup
-		process.on('beforeExit', () => this.close());
-		process.on('SIGINT', () => this.close());
-		process.on('SIGTERM', () => this.close());
+		this.on('error', (error) => {
+			this.logger.error('Client error:', error);
+		});
 	}
 
-	/**
-	 * Create a new vector collection
-	 */
 	async createCollection(params: CreateCollectionParams): Promise<ApiResponse> {
 		const payload = {
 			name: params.name,
@@ -143,7 +136,6 @@ export class Client extends EventEmitter {
 			body: JSON.stringify(payload)
 		});
 
-		// Cache collection info on successful creation
 		if (response.success) {
 			this.collectionCache.set(params.name, {
 				name: params.name,
@@ -151,113 +143,52 @@ export class Client extends EventEmitter {
 				enableHnsw: params.enableHnsw ?? true,
 				shards: params.shards ?? 16,
 				m: params.m ?? 16,
-				efConstruction: params.efConstruction ?? 200,
-				createdAt: new Date().toISOString()
+				efConstruction: params.efConstruction ?? 200
 			});
 		}
 
 		return response;
 	}
 
-	/**
-	 * List all collections
-	 */
-	async listCollections(): Promise<CollectionInfo[]> {
-		const cacheKey = 'list_collections';
-
-		// Try cache first for metadata operations
-		const cached = this.queryCache.get(cacheKey);
-		if (cached && cached.matches) {
-			return cached.matches as any; // Type assertion for collections list
-		}
-
-		const response = await this.request<{ collections: CollectionInfo[] }>({
-			method: 'GET',
-			path: '/collections'
-		});
-
-		const collections = response.collections || [];
-
-		// Update collection cache
-		for (const collection of collections) {
-			this.collectionCache.set(collection.name, collection);
-		}
-
-		return collections;
-	}
-
-	/**
-	 * Get collection information
-	 */
-	async describeCollection(name: string): Promise<CollectionInfo> {
-		// Check local cache first
-		const cached = this.collectionCache.get(name);
-		if (cached) {
-			return cached;
-		}
-
-		const response = await this.request<CollectionInfo>({
-			method: 'GET',
-			path: `/collections/${encodeURIComponent(name)}`
-		});
-
-		// Cache the result
-		this.collectionCache.set(name, response);
-
-		return response;
-	}
-
-	/**
-	 * Delete a collection
-	 */
-	async deleteCollection(name: string): Promise<ApiResponse> {
-		const response = await this.request<ApiResponse>({
-			method: 'DELETE',
-			path: `/collections/${encodeURIComponent(name)}`
-		});
-
-		// Clear caches
-		this.collectionCache.delete(name);
-		this.queryCache.clear(); // Simple approach: clear all query cache
-
-		return response;
-	}
-
-	/**
-	 * Get collection dimensions (cached)
-	 */
-	async getCollectionDimensions(collectionName: string): Promise<number | undefined> {
+	private async getCollectionDimensions(collectionName: string): Promise<number | undefined> {
 		const cached = this.collectionCache.get(collectionName);
 		if (cached?.dimensions) {
 			return cached.dimensions;
 		}
 
 		try {
-			const info = await this.describeCollection(collectionName);
-			return info.dimensions;
+			const info = await this.request<CollectionInfo>({
+				method: 'GET',
+				path: `/collections/${collectionName}`
+			});
+
+			if (info.dimensions) {
+				this.collectionCache.set(collectionName, info);
+				return info.dimensions;
+			}
 		} catch (error) {
-			this.logger.warn(`Failed to get dimensions for collection ${collectionName}:`, error);
-			return undefined;
+			this.logger.warn(`Could not get dimensions for collection ${collectionName}:`, error);
 		}
+
+		return undefined;
 	}
 
-	/**
-	 * Validate vector dimensions against collection
-	 */
-	async validateVectorDimensions(collectionName: string, vector: number[]): Promise<boolean> {
+	private async validateVectorDimensions(collectionName: string, vector: number[]): Promise<boolean> {
 		const expectedDims = await this.getCollectionDimensions(collectionName);
-		if (expectedDims === undefined) {
-			return true; // Can't validate without expected dimensions
+		if (expectedDims === undefined) return true;
+
+		if (vector.length !== expectedDims) {
+			throw new Error(
+				`Vector dimension mismatch: got ${vector.length}, expected ${expectedDims} for collection '${collectionName}'`
+			);
 		}
-		return vector.length === expectedDims;
+
+		return true;
 	}
 
-	/**
-	 * Batch insert with performance optimizations
-	 */
-	async batchInsert(
+	async upsert(
+		collectionName: string,
 		records: VectorRecord[],
-		collectionName: string = 'default',
 		options: {
 			batchSize?: number;
 			showProgress?: boolean;
@@ -269,12 +200,8 @@ export class Client extends EventEmitter {
 			return { upserted_count: 0 };
 		}
 
-		const {
-			validateDimensions = true,
-			parallelism = Math.min(cpus().length, 8)
-		} = options;
+		const { validateDimensions = true } = options;
 
-		// Validate dimensions if requested
 		if (validateDimensions && records.length > 0) {
 			const expectedDims = await this.getCollectionDimensions(collectionName);
 			if (expectedDims !== undefined) {
@@ -289,14 +216,10 @@ export class Client extends EventEmitter {
 			}
 		}
 
-		// Use vector operations for optimized batching
 		const vectorOps = this.vectorOperations(collectionName);
 		return vectorOps.upsert(records, options);
 	}
 
-	/**
-	 * Get vector operations interface
-	 */
 	vectorOperations(collectionName: string = 'default'): VectorOperations {
 		return new VectorOperations(
 			this.host,
@@ -313,16 +236,10 @@ export class Client extends EventEmitter {
 		);
 	}
 
-	/**
-	 * Alias for vectorOperations for Python API compatibility
-	 */
 	vector_operations(collectionName: string = 'default'): VectorOperations {
 		return this.vectorOperations(collectionName);
 	}
 
-	/**
-	 * Force commit to disk
-	 */
 	async commit(): Promise<ApiResponse> {
 		return this.request<ApiResponse>({
 			method: 'POST',
@@ -330,9 +247,6 @@ export class Client extends EventEmitter {
 		});
 	}
 
-	/**
-	 * Check server health
-	 */
 	async health(): Promise<HealthResponse> {
 		return this.request<HealthResponse>({
 			method: 'GET',
@@ -341,9 +255,6 @@ export class Client extends EventEmitter {
 		});
 	}
 
-	/**
-	 * Get server information
-	 */
 	async info(): Promise<InfoResponse> {
 		const cacheKey = 'server_info';
 		const cached = this.queryCache.get(cacheKey);
@@ -351,33 +262,31 @@ export class Client extends EventEmitter {
 			return cached.matches as any;
 		}
 
-		const response = await this.request<InfoResponse>({
+		return this.request<InfoResponse>({
 			method: 'GET',
 			path: '/info',
 			timeout: 10
 		});
-
-		return response;
 	}
 
-	/**
-	 * Clear all caches
-	 */
 	async clearCache(): Promise<{ success: boolean; message: string }> {
 		this.queryCache.clear();
 		this.collectionCache.clear();
 		return { success: true, message: 'All caches cleared' };
 	}
 
-	/**
-	 * High-performance HTTP request with connection pooling and retries
-	 */
 	async request<T = any>(options: RequestOptions): Promise<T> {
-		const { method, path, headers = {}, body, timeout = this.config.timeout } = options;
+		if (this.isDestroyed) {
+			throw new Error('Client has been destroyed');
+		}
 
+		const { method, path, headers = {}, body, timeout = this.config.timeout } = options;
 		let lastError: Error;
 
 		for (let attempt = 0; attempt < this.config.retryAttempts; attempt++) {
+			const controller = new AbortController();
+			this.pendingRequests.add(controller);
+
 			try {
 				const startTime = performance.now();
 
@@ -391,27 +300,26 @@ export class Client extends EventEmitter {
 						...headers
 					},
 					body,
-					timeout: timeout * 1000 // Convert to milliseconds
+					timeout: timeout * 1000
 				});
 
-				// Track performance metrics
 				const duration = performance.now() - startTime;
 				this.requestCount++;
 				this.requestTimes.push(duration);
 
-				// Keep only last 1000 request times for memory efficiency
 				if (this.requestTimes.length > 1000) {
 					this.requestTimes = this.requestTimes.slice(-500);
 				}
 
+				this.pendingRequests.delete(controller);
 				return result;
 
 			} catch (error) {
+				this.pendingRequests.delete(controller);
 				lastError = error as Error;
 				this.logger.debug(`Request attempt ${attempt + 1} failed:`, error);
 
 				if (attempt < this.config.retryAttempts - 1) {
-					// Exponential backoff with jitter
 					const delay = Math.min(1000 * Math.pow(2, attempt) + Math.random() * 100, 10000);
 					await new Promise(resolve => setTimeout(resolve, delay));
 				}
@@ -421,22 +329,9 @@ export class Client extends EventEmitter {
 		throw lastError!;
 	}
 
-	/**
-	 * Perform actual HTTP request with connection pooling
-	 */
 	private async performRequest<T>(options: RequestOptions): Promise<T> {
-		const url = new URL(this.host);
-		const isHttps = url.protocol === 'https:';
-
-		return this.performHttp1Request<T>(options, isHttps);
-	}
-
-	/**
-	 * HTTP/1.1 fallback request
-	 */
-	private async performHttp1Request<T>(options: RequestOptions, isHttps: boolean): Promise<T> {
 		const url = new URL(this.host + options.path);
-		const requestModule = isHttps ? https : http;
+		const requestModule = url.protocol === 'https:' ? https : http;
 
 		return new Promise<T>((resolve, reject) => {
 			const timeoutId = setTimeout(() => {
@@ -461,7 +356,6 @@ export class Client extends EventEmitter {
 
 				res.on('end', async () => {
 					try {
-						// Handle compression
 						let finalData = responseData;
 						const contentEncoding = res.headers['content-encoding'];
 
@@ -504,7 +398,6 @@ export class Client extends EventEmitter {
 				reject(new Error('Request timeout'));
 			});
 
-			// Send request body
 			if (options.body) {
 				req.write(options.body);
 			}
@@ -513,91 +406,22 @@ export class Client extends EventEmitter {
 		});
 	}
 
-	/**
-	 * Get or create HTTP/2 connection with connection pooling
-	 */
-	private async getOrCreateHttp2Connection(): Promise<PooledConnection> {
-		const url = new URL(this.host);
-		const connectionKey = `${url.protocol}//${url.host}`;
-
-		// Find existing connection with available capacity
-		const existing = this.connectionPool.get(connectionKey);
-		if (existing &&
-			existing.activeStreams < this.maxStreamsPerConnection &&
-			!existing.client.destroyed &&
-			!existing.client.closed) {
-			return existing;
-		}
-
-		// Create new connection
-		const client = http2.connect(this.host, {
-			maxSessionMemory: 100 // 100 MB
-		});
-
-		const connection: PooledConnection = {
-			client,
-			activeStreams: 0,
-			lastUsed: Date.now(),
-			host: connectionKey
-		};
-
-		// Handle connection events
-		client.on('error', (error) => {
-			this.logger.error('HTTP/2 connection error:', error);
-			this.connectionPool.delete(connectionKey);
-		});
-
-		client.on('close', () => {
-			this.logger.debug('HTTP/2 connection closed');
-			this.connectionPool.delete(connectionKey);
-		});
-
-		this.connectionPool.set(connectionKey, connection);
-		this.logger.debug(`Created new HTTP/2 connection to ${connectionKey}`);
-
-		return connection;
-	}
-
-	/**
-	 * Periodic cleanup of stale connections and caches
-	 */
 	private cleanup(): void {
 		if (this.isDestroyed) return;
 
-		const now = Date.now();
-		const staleTimeout = 60000; // 1 minute
-
-		// Clean up stale connections
-		for (const [key, connection] of this.connectionPool) {
-			if (now - connection.lastUsed > staleTimeout && connection.activeStreams === 0) {
-				this.logger.debug(`Closing stale connection to ${key}`);
-				connection.client.close();
-				this.connectionPool.delete(key);
-			}
-		}
-
-		// Emit metrics for monitoring
 		this.emit('metrics', {
-			connections: this.connectionPool.size,
 			requestCount: this.requestCount,
 			avgRequestTime: this.requestTimes.length > 0
 				? this.requestTimes.reduce((a, b) => a + b, 0) / this.requestTimes.length
 				: 0,
 			cacheStats: this.queryCache.getStats(),
-			uptime: now - this.startTime
+			uptime: Date.now() - this.startTime
 		});
 	}
 
-	/**
-	 * Get performance statistics
-	 */
 	getStats(): Record<string, any> {
 		const now = Date.now();
 		return {
-			connections: {
-				active: this.connectionPool.size,
-				maxConnections: this.maxConnections
-			},
 			requests: {
 				total: this.requestCount,
 				avgTime: this.requestTimes.length > 0
@@ -612,57 +436,34 @@ export class Client extends EventEmitter {
 		};
 	}
 
-	/**
-	 * Graceful shutdown and resource cleanup
-	 */
 	async close(): Promise<void> {
 		if (this.isDestroyed) return;
 
 		this.isDestroyed = true;
-		this.logger.info('Closing Antarys client...');
+		globalClients.delete(this);
 
-		// Clear cleanup interval
+		for (const controller of this.pendingRequests) {
+			try {
+				controller.abort();
+			} catch (error) { }
+		}
+		this.pendingRequests.clear();
+
 		if (this.cleanupInterval) {
 			clearInterval(this.cleanupInterval);
+			this.cleanupInterval = undefined;
 		}
 
-		// Close all HTTP/2 connections
-		const closePromises: Promise<void>[] = [];
-		for (const [key, connection] of this.connectionPool) {
-			closePromises.push(
-				new Promise<void>((resolve) => {
-					connection.client.close(() => {
-						this.logger.debug(`Closed connection to ${key}`);
-						resolve();
-					});
-				})
-			);
-		}
-
-		// Wait for all connections to close (with timeout)
 		try {
-			await Promise.race([
-				Promise.all(closePromises),
-				new Promise(resolve => setTimeout(resolve, 5000)) // 5 second timeout
-			]);
-		} catch (error) {
-			this.logger.warn('Some connections may not have closed cleanly:', error);
-		}
+			this.queryCache.destroy();
+			this.bufferPool.clear();
+			this.collectionCache.clear();
+		} catch (error) { }
 
-		// Clean up caches and pools
-		this.queryCache.destroy();
-		this.bufferPool.clear();
-		this.collectionCache.clear();
-		this.connectionPool.clear();
-
-		this.logger.info('Antarys client closed successfully');
 		this.removeAllListeners();
 	}
 }
 
-/**
- * Create a new Antarys client with optimized defaults
- */
 export function createClient(host: string, config: ClientConfig = {}): Client {
 	return new Client(host, config);
 }
